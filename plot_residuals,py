@@ -1,0 +1,374 @@
+import plotly.graph_objects as go
+import tensorflow as tf
+import pickle
+import os
+from plotly.subplots import make_subplots
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import normaltest
+
+tfk = tf.keras 
+
+def series_to_supervised(df, lags_in, lags_forecast):
+    # name of the series considered
+    var_name = df.head().name
+    cols, names = [], []
+    # appending the series shifted by one on the right in order to have
+    # columns from var(t-lags_in), ..., var(t-1)
+    for i in range(lags_in, 0, -1):
+        cols.append(df.shift(i))
+        # column name
+        names.append("".join([var_name, "(t-", str(i), ")"]))
+    # create new pandas dataframe
+    df_x = pd.concat(cols, axis=1)
+    df_x.columns = names
+    # dropping row with not a number items (it means they are out of the interval)
+    df_x = df_x.dropna()
+    # taking only the rows with hour == 0 because we are forecsting only one time
+    # at midnight the next day
+    df_x = df_x[df_x.index.hour == 0]
+    cols, names = [], []
+    # appending the series shifted by minus one on the right in order to 
+    # have columns from var(t), ..., var(t+lags_forecast)
+    for i in range(0, lags_forecast):
+        cols.append(df.shift(-i))
+        if i == 0:
+            names.append("".join([var_name, "(t)"]))
+        else:
+            names.append("".join([var_name, "(t+", str(i), ")"]))
+    # same operations as before
+    df_y = pd.concat(cols, axis=1)
+    df_y.columns = names
+    df_y = df_y.dropna()
+    df_y = df_y[df_y.index.hour == 0][int(lags_in/24):]
+    df_x = df_x[df_x.index.isin(df_y.index)]
+    return df_x, df_y
+
+def compute_direct_impact(df_tech, df_impacts, impacts, match_tech):
+    # assign to every column in dftech a parto of the string
+    # in dfImpacts columns
+    df_tech_impact = pd.DataFrame()
+    for impact in impacts:
+        direct_impact = 0
+        for technology in df_tech.columns:
+            impact_name = match_tech[technology]
+            direct_impact += df_tech[technology] * df_impacts[df_impacts['Impact category'] == impact][impact_name].values
+        df_tech_impact[impact] = direct_impact
+    return df_tech_impact
+
+colors = {'DF - linear regression': 'red', 'ETMF - linear regression': 'blue', 
+          'DF - nn 32 units': 'fuchsia', 'ETMF - nn 32 units': 'yellow',
+          'DF - nn 64 units': 'maroon', 'ETMF - nn 64 units': 'green',
+          'DF - rnn 32 units': 'navy', 'ETMF - rnn 32 units': 'orange',
+          'DF - rnn 64 units': 'dimgray', 'ETMF - rnn 64 units': 'aqua'}
+
+models_dir = './models/'
+plot_dir = './plots/residuals/'
+model_types = ['linear-regression', 'nn', 'rnn']
+perc_train = 0.8
+perc_vali = 0.1
+perc_test = 0.1
+n_units = [32, 64]
+
+#impacts = ['Climate change', 'Particulate Matter']
+#match_tech = {'Biomass': 'biomass', 'Fossil Hard coal': 'hard coal', 'Fossil Coal-derived gas': 'coal gases', 
+#             'Fossil Gas': 'natural gas', 'Fossil Oil': 'HFO', 'Geothermal': 'geothermal', 'Hydro Pumped Storage': 'hydro',
+#             'Hydro': 'hydro', 'Solar': 'photovoltaic', 'Wind Onshore': 'wind'}
+match_tech = {'Biomass': 'Biomass', 'Fossil Hard coal': 'Fossil Hard coal', 'Fossil Coal-derived gas': 'Fossil Coal-derived gas', 
+             'Fossil Gas': 'Fossil Gas', 'Fossil Oil': 'Fossil Oil', 'Geothermal': 'Geothermal', 'Hydro Pumped Storage': 'Hydro Pumped Storage',
+             'Hydro': 'Hydro', 'Solar': 'Solar', 'Wind Onshore': 'Wind Onshore'}
+
+impacts = ['climate change total', 'respiratory effects, inorganics']
+impact_models = ['direct', 'composed']
+
+n_plot = 3
+technologies_df = pd.read_pickle('data/technologiesDFFilled.pkl')
+#impact_df = pd.read_csv('data/climate-change-impacts.csv')
+impact_df = pd.read_csv('data/use-phase-unitary-impacts.csv')
+indeces = pd.read_pickle('./data/indeces.pkl')
+
+df_total_impact = compute_direct_impact(technologies_df, impact_df, impacts, match_tech)
+# scale dataframe
+scaler_dir = StandardScaler()
+scaled_values = scaler_dir.fit_transform(df_total_impact.values)
+df_total_impact = pd.DataFrame(scaled_values, index=df_total_impact.index, columns=df_total_impact.columns)
+scaler_tech = StandardScaler()
+scaled_values = scaler_tech.fit_transform(technologies_df.values)
+technologies_df = pd.DataFrame(scaled_values, index=technologies_df.index, columns=technologies_df.columns)
+df_test = pd.DataFrame(columns=['num_units', 'impact', 'impact_model', 'model_type', 'p_value', 'alpha'])
+
+impact_units = {'climate change total': '[t CO_2eq/MWh]',
+                'respiratory effects, inorganics': '[desease i./MWh]'}
+#compute production
+for i, technology in enumerate(technologies_df.keys()):
+    # select technology
+    df = technologies_df[technology]
+    x, y = series_to_supervised(df, lags_in=7*24, lags_forecast=24)
+    x = x.loc[indeces.index]
+    y = y.loc[x.index]
+    x_test = x.iloc[int(perc_train*len(x))+int(perc_vali*len(x)):]
+    y_test = y.loc[x_test.index]
+    if i == 0:
+        total_production = np.zeros_like(y_test.values)
+    total_production += (y_test.values * scaler_tech.scale_[i] + scaler_tech.mean_[i]) 
+for k, impact in enumerate(impacts):
+    cont = 0
+    fig = make_subplots(5, 2)
+    impact_coeffs = impact_df[impact_df['Impact category'] == impact]
+    total_direct_impact = df_total_impact[impact]
+    x, y = series_to_supervised(total_direct_impact, lags_in=7*24, lags_forecast=24)
+    x = x.loc[indeces.index]
+    y = y.loc[x.index]
+    x_total = x.iloc[int(perc_train*len(x))+int(perc_vali*len(x)):]
+    actual = y.loc[x_total.index]
+
+    for impact_model in impact_models:
+        for model_type in model_types:
+            for j, n_unit in enumerate(n_units):
+                message = "".join(['Processing ', impact,  ' - ', model_type, ' - ', impact_model])
+                print(message)
+                if model_type == 'linear-regression':
+                    if j > 0:
+                        continue
+                    LINEAR = True
+                    NN = False
+                    RNN = False
+                    #results_path = os.path.join('results', data_type, 'linear-regression')
+                    models_path = os.path.join('models', 'linear-regression')
+                elif model_type == 'nn':
+                    LINEAR = False
+                    NN = True
+                    RNN = False
+                    #results_path = os.path.join('results', data_type, 'nn', "".join([str(n_unit), 'neurons']))
+                    models_path = os.path.join('models', 'nn', "".join([str(n_unit), 'neurons']))
+                elif model_type == 'rnn':
+                    LINEAR = False
+                    NN = False
+                    RNN = True
+                    #results_path = os.path.join('results', data_type, 'rnn', "".join([str(n_unit), 'neurons']))
+                    models_path = os.path.join('models', 'rnn', "".join([str(n_unit), 'neurons']))
+
+                if impact_model == 'direct':
+                    if LINEAR:
+                        model_path = os.path.join(models_path, "".join([impact.replace(" ", "-"), "-model.pkl"]))
+                        with open(model_path, 'rb') as file:
+                            model = pickle.load(file)
+                    else:
+                        model_path = os.path.join(models_path, impact.replace(" ", "-"))
+                        model = tfk.models.load_model(model_path)
+
+                    if RNN:
+                        x_rnn = x_total.values[:, :, np.newaxis]
+                        total_forecast = model.predict(x_rnn)
+                    else:
+                        total_forecast = model.predict(x_total.values)
+                    total_forecast = total_forecast * scaler_dir.scale_[k] + scaler_dir.mean_[k] 
+
+                elif impact_model == 'composed':
+                    for i, technology in enumerate(technologies_df.keys()):
+                        # select technology
+                        df = technologies_df[technology]
+                        impact_name = match_tech[technology]
+                        impact_coeff = impact_coeffs[impact_name]
+                        x, y = series_to_supervised(df, lags_in=7*24, lags_forecast=24)
+                        x = x.loc[indeces.index]
+                        y = y.loc[x.index]
+                        x_test = x.iloc[int(perc_train*len(x))+int(perc_vali*len(x)):]
+                        y_test = y.loc[x_test.index]
+                        if i == 0:
+                            total_forecast = np.zeros_like(y_test.values)
+
+                        if LINEAR:
+                            model_path = os.path.join(models_path, "".join([technology.replace(" ", "-"), "-model.pkl"]))
+                            with open(model_path, 'rb') as file:
+                                model = pickle.load(file)
+                        else:
+                            model_path = os.path.join(models_path, technology.replace(" ", "-"))
+                            model = tfk.models.load_model(model_path)
+                                
+                        if RNN:
+                            x_rnn = x_test.values[:, :, np.newaxis]
+                            forecast = model.predict(x_rnn)
+                        else:
+                            forecast = model.predict(x_test.values)
+
+                        #total_forecast += forecast
+                        total_forecast += (forecast * scaler_tech.scale_[i] + scaler_tech.mean_[i]) * impact_coeff.values
+
+                else:
+                    raise TypeError(impact_model)
+                
+                total_prevision = total_forecast / total_production
+                unscaled_actual = actual * scaler_dir.scale_[k] + scaler_dir.mean_[k]
+                total_unscaled_actual = unscaled_actual / total_production
+                #residual = total_forecast - unscaled_actual
+                residual = total_prevision - total_unscaled_actual
+                residual = residual.values.reshape(-1)
+
+                k2, p = normaltest(residual)
+                alpha = 1e-2
+                if p < alpha:
+                    print("The null hypotesis can be rejected")
+                else:
+                    print("The distribution can be gaussian")
+                print("Residual mean: {}".format(residual.mean()))
+                df_test.append({'num_units': n_unit, 'impact': impact, 'impact_model': impact_model,
+                                'model_type': model_type, 'p_value': p, 'alpha': alpha}, ignore_index=True)
+
+                if k == 0:
+                    legend = True
+                else:
+                    legend = True
+                if LINEAR:
+                    if impact_model == 'composed':
+                        name_plot = "".join(['ETMF', ' - linear regression'])
+                    else:
+                        name_plot = "".join(['DF', ' - linear regression'])
+                else:
+                    if impact_model == 'composed':
+                        name_plot = "".join(['ETMF', ' - ', model_type, ' ', str(n_unit), ' units'])
+                    else:
+                        name_plot = "".join(['DF', ' - ', model_type, ' ', str(n_unit), ' units'])
+                color_plot = colors[name_plot]
+                fig.add_trace(go.Histogram(x=residual, marker=dict(color=color_plot),
+                                           name=name_plot, showlegend=legend),
+                              row=int(np.floor(cont/2))+1, col=cont%2+1)
+                cont += 1
+
+    fig.update_layout(font=dict(size=36), barmode='overlay')
+    fig.update_xaxes(title_text=impact_units[impact], row=5, col=1)
+    fig.update_xaxes(title_text=impact_units[impact], row=5, col=2)
+#fig.update_xaxes(title_text='[desease i./MWh]', row=5, col=2)
+#fig.update_traces(opacity=0.2)
+    plot_path = os.path.join(plot_dir, "".join(['total-residuals-{}'.format(impact), '.html']))
+    fig.write_html(plot_path) 
+    fig.show()
+df_test.to_pickle('results/residual-test-df.pkl')
+
+
+for impact_model in impact_models:
+    fig = make_subplots(5, 2)
+    for k, impact in enumerate(impacts):
+        impact_coeffs = impact_df[impact_df['Impact category'] == impact]
+        total_direct_impact = df_total_impact[impact]
+        x, y = series_to_supervised(total_direct_impact, lags_in=7*24, lags_forecast=24)
+        x = x.loc[indeces.index]
+        y = y.loc[x.index]
+        x_total = x.iloc[int(perc_train*len(x))+int(perc_vali*len(x)):]
+        actual = y.loc[x_total.index]
+
+        for model_type in model_types:
+            for j, n_unit in enumerate(n_units):
+                message = "".join(['Processing ', impact,  ' - ', model_type, ' - ', impact_model])
+                print(message)
+                if model_type == 'linear-regression':
+                    if j > 0:
+                        continue
+                    LINEAR = True
+                    NN = False
+                    RNN = False
+                    row = 1
+                    #results_path = os.path.join('results', data_type, 'linear-regression')
+                    models_path = os.path.join('models', 'linear-regression')
+                elif model_type == 'nn':
+                    LINEAR = False
+                    NN = True
+                    RNN = False
+                    #results_path = os.path.join('results', data_type, 'nn', "".join([str(n_unit), 'neurons']))
+                    models_path = os.path.join('models', 'nn', "".join([str(n_unit), 'neurons']))
+                    row = 2
+                elif model_type == 'rnn':
+                    LINEAR = False
+                    NN = False
+                    RNN = True
+                    #results_path = os.path.join('results', data_type, 'rnn', "".join([str(n_unit), 'neurons']))
+                    models_path = os.path.join('models', 'rnn', "".join([str(n_unit), 'neurons']))
+                    row = 4
+
+                if impact_model == 'direct':
+                    if LINEAR:
+                        model_path = os.path.join(models_path, "".join([impact.replace(" ", "-"), "-model.pkl"]))
+                        with open(model_path, 'rb') as file:
+                            model = pickle.load(file)
+                    else:
+                        model_path = os.path.join(models_path, impact.replace(" ", "-"))
+                        model = tfk.models.load_model(model_path)
+
+                    if RNN:
+                        x_rnn = x_total.values[:, :, np.newaxis]
+                        total_forecast = model.predict(x_rnn)
+                    else:
+                        total_forecast = model.predict(x_total.values)
+                    total_forecast = total_forecast * scaler_dir.scale_[k] + scaler_dir.mean_[k] 
+
+                elif impact_model == 'composed':
+                    for i, technology in enumerate(technologies_df.keys()):
+                        # select technology
+                        df = technologies_df[technology]
+                        impact_name = match_tech[technology]
+                        impact_coeff = impact_coeffs[impact_name]
+                        x, y = series_to_supervised(df, lags_in=7*24, lags_forecast=24)
+                        x = x.loc[indeces.index]
+                        y = y.loc[x.index]
+                        x_test = x.iloc[int(perc_train*len(x))+int(perc_vali*len(x)):]
+                        y_test = y.loc[x_test.index]
+                        if i == 0:
+                            total_forecast = np.zeros_like(y_test.values)
+
+                        if LINEAR:
+                            model_path = os.path.join(models_path, "".join([technology.replace(" ", "-"), "-model.pkl"]))
+                            with open(model_path, 'rb') as file:
+                                model = pickle.load(file)
+                        else:
+                            model_path = os.path.join(models_path, technology.replace(" ", "-"))
+                            model = tfk.models.load_model(model_path)
+                                
+                        if RNN:
+                            x_rnn = x_test.values[:, :, np.newaxis]
+                            forecast = model.predict(x_rnn)
+                        else:
+                            forecast = model.predict(x_test.values)
+
+                        #total_forecast += forecast
+                        total_forecast += (forecast * scaler_tech.scale_[i] + scaler_tech.mean_[i]) * impact_coeff.values
+
+                else:
+                    raise TypeError(impact_model)
+                
+                total_prevision = total_forecast / total_production
+                unscaled_actual = actual * scaler_dir.scale_[k] + scaler_dir.mean_[k]
+                total_unscaled_actual = unscaled_actual / total_production
+                #residual = total_forecast - unscaled_actual
+                residual = total_prevision - total_unscaled_actual
+                residual = residual.values.reshape(-1)
+
+                if k == 0:
+                    legend = True
+                else:
+                    legend = False
+                if LINEAR:
+                    if impact_model == 'composed':
+                        name_plot = "".join(['ETMF', ' - linear regression'])
+                    else:
+                        name_plot = "".join(['DF', ' - linear regression'])
+                else:
+                    if impact_model == 'composed':
+                        name_plot = "".join(['ETMF', ' - ', model_type, ' ', str(n_unit), ' units'])
+                    else:
+                        name_plot = "".join(['DF', ' - ', model_type, ' ', str(n_unit), ' units'])
+                color_plot = colors[name_plot]
+                fig.add_trace(go.Histogram(x=residual, marker=dict(color=color_plot),
+                                           name=name_plot, showlegend=legend),
+                              row=row+j, col=k+1)
+
+    fig.update_layout(font=dict(size=36), barmode='overlay')
+    fig.update_xaxes(title_text='[t CO_2eq/MWh]', row=5, col=1)
+    fig.update_xaxes(title_text='[kItems/MWh]', row=5, col=2)
+    fig.update_traces(opacity=0.3)
+    if impact_model == 'composed':
+        plot_path = os.path.join(plot_dir, "".join(['total-residuals', 'ETMF', '.html']))
+    else:
+        plot_path = os.path.join(plot_dir, "".join(['total-residuals', 'DF', '.html']))
+    fig.write_html(plot_path) 
+    fig.show()
